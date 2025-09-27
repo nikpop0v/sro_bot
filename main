@@ -1,0 +1,187 @@
+import os
+import asyncio
+import faiss
+import aiosqlite
+from datetime import datetime
+from dotenv import load_dotenv
+from aiogram.types import FSInputFile
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.enums import ParseMode, ChatAction
+from gigachat import GigaChat
+from sentence_transformers import SentenceTransformer
+import openpyxl
+
+# === Загрузка конфигов ===
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2")
+VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "1").lower() not in ("0", "false", "no")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+SYSTEM_PROMPT = "Ты дружелюбный помощник. Отвечай, опираясь на предоставленную базу знаний."
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+DB_PATH = "bot_logs.db"
+
+# === Инициализация базы данных ===
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                question TEXT,
+                answer TEXT,
+                timestamp TEXT,
+                rating INTEGER
+            )
+        """)
+        await db.commit()
+
+# === RAG для .md файла ===
+def load_chunks(md_path: str, chunk_size: int = 800, overlap: int = 200):
+    with open(md_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+def embed_texts(texts):
+    vectors = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    return vectors.astype("float32")
+
+def build_index(chunks, vectors):
+    dim = vectors.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(vectors)
+    return index
+
+def search_chunks(query, index, chunks, k=3):
+    q_emb = embed_texts([query])
+    D, I = index.search(q_emb, k)
+    return [chunks[i] for i in I[0]]
+
+def make_prompt(user_message, context_chunks):
+    context = "\n---\n".join(context_chunks)
+    return f"""{SYSTEM_PROMPT}
+
+Используй только эту информацию:
+{context}
+
+Вопрос: {user_message}
+"""
+
+CHUNKS = load_chunks("knowledge.md")
+VECTORS = embed_texts(CHUNKS)
+INDEX = build_index(CHUNKS, VECTORS)
+
+def ask_gigachat_sync(user_text: str) -> str:
+    with GigaChat(
+        credentials=GIGACHAT_CREDENTIALS,
+        scope=GIGACHAT_SCOPE,
+        model=GIGACHAT_MODEL,
+        verify_ssl_certs=VERIFY_SSL,
+    ) as giga:
+        ctx = search_chunks(user_text, INDEX, CHUNKS)
+        prompt = make_prompt(user_text, ctx)
+        response = giga.chat(prompt)
+        return response.choices[0].message.content.strip()
+
+# === Хэндлеры ===
+@dp.message(CommandStart())
+async def on_start(message: Message):
+    await message.answer(
+        f"Привет, {message.from_user.full_name}!\n"
+        "Используй /export чтобы выгрузить логи (только для админа)."
+    )
+
+# --- Экспорт в Excel (ставим хэндлер выше, чтобы не перехватывался F.text) ---
+@dp.message(Command("export"))
+async def export_excel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("У тебя нет прав для экспорта.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT * FROM logs")
+        rows = await cursor.fetchall()
+
+    if not rows:
+        await message.answer("Логи пустые — пока нечего экспортировать.")
+        return
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["ID", "User ID", "Username", "Question", "Answer", "Timestamp", "Rating"])
+    for row in rows:
+        ws.append(row)
+
+    filename = "logs.xlsx"
+    wb.save(filename)
+
+    # отправляем и закрываем файл
+    filename = "logs.xlsx"
+    wb.save(filename)
+
+    await message.answer_document(document=FSInputFile(path=filename))
+
+@dp.message(F.text & ~F.text.startswith("/"))  # исключаем команды
+async def on_text(message: Message):
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    try:
+        answer = await asyncio.to_thread(ask_gigachat_sync, message.text)
+    except Exception as e:
+        answer = f"Ошибка: {e}"
+
+    # Логируем вопрос-ответ
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO logs (user_id, username, question, answer, timestamp, rating) VALUES (?, ?, ?, ?, ?, ?)",
+            (message.from_user.id, message.from_user.username, message.text, answer, datetime.now().isoformat(), None),
+        )
+        await db.commit()
+
+    # Кнопки для оценки
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="-2", callback_data="rate:-2"),
+        InlineKeyboardButton(text="-1", callback_data="rate:-1"),
+        InlineKeyboardButton(text="0", callback_data="rate:0"),
+        InlineKeyboardButton(text="+1", callback_data="rate:1"),
+        InlineKeyboardButton(text="+2", callback_data="rate:2"),
+    ]])
+
+    await message.answer(answer, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def on_rate(callback: CallbackQuery):
+    rating = int(callback.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM logs WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (callback.from_user.id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            await db.execute("UPDATE logs SET rating = ? WHERE id = ?", (rating, row[0]))
+            await db.commit()
+    await callback.answer(f"Оценка {rating} сохранена!")
+
+# === Запуск ===
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
