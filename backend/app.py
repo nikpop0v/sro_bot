@@ -16,7 +16,7 @@ try:
 except Exception:
     GigaChat = None
 
-app = FastAPI(title="Pangea RAG API", version="1.0.0")
+app = FastAPI(title="SRO BOT API", version="1.0.0")
 
 # === Глобальные объекты ===
 MODEL = None
