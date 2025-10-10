@@ -1,15 +1,15 @@
 from __future__ import annotations
 import os
-import asyncio
-from typing import List, Optional
+from typing import List, Optional, Literal
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import numpy as np
 
 from .rag import load_chunks, get_model, embed_texts, build_index, search
-from .storage import init_db, insert_log, set_rating_by_id
+from .storage import init_db, insert_log, set_rating_by_id, fetch_logs
 
 try:
     from gigachat import GigaChat  # опционально
@@ -18,7 +18,7 @@ except Exception:
 
 app = FastAPI(title="Pangea RAG API", version="1.0.0")
 
-# === Глобальные объекты (пересоздаются при /reload) ===
+# === Глобальные объекты ===
 MODEL = None
 INDEX = None
 CHUNKS: List[str] = []
@@ -30,14 +30,16 @@ class AskRequest(BaseModel):
     chat_id: Optional[str] = None
     top_k: Optional[int] = None
 
+
 class AskResponse(BaseModel):
     answer: str
     context: List[str]
     log_id: int
 
+
 class FeedbackRequest(BaseModel):
     log_id: int
-    rating: int  # -1/0/1
+    rating: Literal[-2, -1, 0, 1, 2]  # пятибалльная шкала
 
 
 async def _ensure_ready():
@@ -57,7 +59,6 @@ def _answer_with_gigachat(prompt: str) -> str:
     token = os.getenv("GIGACHAT_AUTH_TOKEN")
     model_name = os.getenv("GIGACHAT_MODEL", "gigachat")
     if not token or GigaChat is None:
-        # Фолбэк: без LLM просто вернём контекст
         return "(LLM не настроен)\n\n" + prompt
     try:
         with GigaChat(credentials=token, model=model_name, verify_ssl_certs=False) as giga:
@@ -71,7 +72,7 @@ def _answer_with_gigachat(prompt: str) -> str:
 async def startup():
     load_dotenv()
     await init_db()
-    await reload_state()
+    await reload_state()  # <-- теперь функция существует
 
 
 @app.get("/health")
@@ -81,9 +82,9 @@ async def health():
 
 @app.post("/reload")
 async def reload_state():
+    """(Пере)загрузка базы знаний и индекса."""
     global MODEL, INDEX, CHUNKS, EMB
 
-    load_dotenv()
     md_path = os.getenv("KNOWLEDGE_PATH", "knowledge/knowledge.md")
     model_name = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
     chunk_size = int(os.getenv("CHUNK_SIZE", 800))
@@ -115,7 +116,26 @@ async def ask(req: AskRequest):
 
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
-    if req.rating not in (-1, 0, 1):
-        raise HTTPException(400, detail="rating must be -1, 0 or 1")
+    # защита на случай обхода валидации
+    if req.rating not in (-2, -1, 0, 1, 2):
+        raise HTTPException(400, detail="rating must be one of -2,-1,0,1,2")
     await set_rating_by_id(req.log_id, req.rating)
     return {"status": "ok"}
+
+
+@app.get("/export")
+async def export(limit: int = 1000):
+    rows = await fetch_logs(limit)
+    import io, csv
+    buf = io.StringIO()
+    fieldnames = ["id", "ts", "chat_id", "query", "answer", "top_context", "rating"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: (r.get(k, "") or "") for k in fieldnames})
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename=\"logs.csv\"'},
+    )
