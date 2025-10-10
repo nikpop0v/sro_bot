@@ -1,13 +1,14 @@
 import asyncio
 import os
-
+import re
 import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatAction
-from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, BufferedInputFile
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -26,7 +27,7 @@ async def start_cmd(message: Message):
     await message.answer("Привет! Пришли вопрос — отвечу по базе знаний.")
 
 
-@dp.message(F.text & ~F.via_bot)
+@dp.message(F.text & ~F.via_bot & ~F.text.startswith("/"))
 async def handle_question(message: Message):
     text = message.text.strip()
     if not text:
@@ -34,6 +35,17 @@ async def handle_question(message: Message):
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    @dp.message(Command("export"))
+    async def export_cmd(message: Message):
+        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(f"{API_BASE_URL}/export", params={"limit": 1000})
+            resp.raise_for_status()
+            csv_bytes = resp.content
+        await message.answer_document(
+            BufferedInputFile(csv_bytes, filename="logs.csv"),
+            caption="Экспорт логов (последние 1000 записей)"
+        )
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(f"{API_BASE_URL}/ask", json={
             "question": text,
@@ -42,17 +54,22 @@ async def handle_question(message: Message):
         resp.raise_for_status()
         data = resp.json()
 
+    # 1) Санитизируем текст, чтобы не падать на <br>
+    raw = data["answer"]
+    safe_text = re.sub(r'(?i)<br\s*/?>', '\n', raw)
+
+    # 2) Создаём клавиатуру (пятибалльная шкала -2…2)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="2", callback_data=f"rate:{data['log_id']}:2"),
-            InlineKeyboardButton(text="1", callback_data=f"rate:{data['log_id']}:1"),
-            InlineKeyboardButton(text="0", callback_data=f"rate:{data['log_id']}:0"),
-            InlineKeyboardButton(text="-1", callback_data=f"rate:{data['log_id']}:-1"),
             InlineKeyboardButton(text="-2", callback_data=f"rate:{data['log_id']}:-2"),
+            InlineKeyboardButton(text="-1", callback_data=f"rate:{data['log_id']}:-1"),
+            InlineKeyboardButton(text="0",  callback_data=f"rate:{data['log_id']}:0"),
+            InlineKeyboardButton(text="+1", callback_data=f"rate:{data['log_id']}:1"),
+            InlineKeyboardButton(text="+2", callback_data=f"rate:{data['log_id']}:2"),
         ]
     ])
 
-    await message.answer(data["answer"], reply_markup=kb)
+    await message.answer(safe_text, reply_markup=kb, parse_mode=None)
 
 
 @dp.callback_query(F.data.startswith("rate:"))
@@ -72,6 +89,19 @@ async def main():
         print("[WARN] Backend недоступен по", API_BASE_URL)
 
     await dp.start_polling(bot)
+
+@dp.message(Command("export"))  # ✅ НОВЫЙ хэндлер
+async def export_cmd(message: Message):
+    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(f"{API_BASE_URL}/export", params={"limit": 1000})
+        resp.raise_for_status()
+        csv_bytes = resp.content
+
+    await message.answer_document(
+        BufferedInputFile(csv_bytes, filename="logs.csv"),
+        caption="Экспорт логов (последние 1000 записей)"
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
