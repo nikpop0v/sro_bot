@@ -9,12 +9,11 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, BufferedInputFile
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-
+ADMINS = {int(x) for x in os.getenv("ADMINS", "").replace(" ", "").split(",") if x}
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
@@ -35,17 +34,6 @@ async def handle_question(message: Message):
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    @dp.message(Command("export"))
-    async def export_cmd(message: Message):
-        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.get(f"{API_BASE_URL}/export", params={"limit": 1000})
-            resp.raise_for_status()
-            csv_bytes = resp.content
-        await message.answer_document(
-            BufferedInputFile(csv_bytes, filename="logs.csv"),
-            caption="Экспорт логов (последние 1000 записей)"
-        )
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(f"{API_BASE_URL}/ask", json={
             "question": text,
@@ -79,6 +67,23 @@ async def rate_cb(cb: CallbackQuery):
         await client.post(f"{API_BASE_URL}/feedback", json={"log_id": int(log_id), "rating": int(rating)})
     await cb.answer("Спасибо за оценку!")
 
+# /export для АДМИНОВ
+@dp.message(Command("export"), F.from_user & F.from_user.id.in_(ADMINS))
+async def export_admin(message: Message):
+    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(f"{API_BASE_URL}/export", params={"limit": 1000})
+        resp.raise_for_status()
+        csv_bytes = resp.content
+    await message.answer_document(
+        BufferedInputFile(csv_bytes, filename="logs.csv"),
+        caption="Экспорт логов (последние 1000 записей)"
+    )
+
+# /export для всех остальных
+@dp.message(Command("export"))
+async def export_denied(message: Message):
+    await message.answer("Эта команда доступна только администраторам.")
 
 async def main():
     # Проверка, что backend есть
@@ -90,18 +95,7 @@ async def main():
 
     await dp.start_polling(bot)
 
-@dp.message(Command("export"))  # ✅ НОВЫЙ хэндлер
-async def export_cmd(message: Message):
-    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(f"{API_BASE_URL}/export", params={"limit": 1000})
-        resp.raise_for_status()
-        csv_bytes = resp.content
 
-    await message.answer_document(
-        BufferedInputFile(csv_bytes, filename="logs.csv"),
-        caption="Экспорт логов (последние 1000 записей)"
-    )
 
 if __name__ == "__main__":
     asyncio.run(main())
