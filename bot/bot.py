@@ -9,6 +9,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, BufferedInputFile
 from dotenv import load_dotenv
 
+
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -67,19 +69,36 @@ async def rate_cb(cb: CallbackQuery):
         await client.post(f"{API_BASE_URL}/feedback", json={"log_id": int(log_id), "rating": int(rating)})
     await cb.answer("Спасибо за оценку!")
 
-# /export для АДМИНОВ
 @dp.message(Command("export"), F.from_user & F.from_user.id.in_(ADMINS))
-async def export_admin(message: Message):
-    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_DOCUMENT)
+async def export_admin_menu(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Сегодня", callback_data="export:today"),
+        InlineKeyboardButton(text="Неделя",  callback_data="export:week"),
+        InlineKeyboardButton(text="Месяц",   callback_data="export:month"),
+    ]])
+    await message.answer("Выберите период для экспорта:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("export:"))
+async def export_period_cb(cb: CallbackQuery):
+    # безопасность: проверим админа и здесь тоже
+    if not (cb.from_user and cb.from_user.id in ADMINS):
+        await cb.answer("Только для админов", show_alert=True)
+        return
+
+    period = cb.data.split(":", 1)[1]  # today | week | month
+    await bot.send_chat_action(cb.message.chat.id, ChatAction.UPLOAD_DOCUMENT)
+
     async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(f"{API_BASE_URL}/export", params={"limit": 1000})
+        resp = await client.get(f"{API_BASE_URL}/export", params={"period": period})
         resp.raise_for_status()
         csv_bytes = resp.content
-    await message.answer_document(
-        BufferedInputFile(csv_bytes, filename="logs.csv"),
-        caption="Экспорт логов (последние 1000 записей)"
-    )
 
+    await cb.message.answer_document(
+        BufferedInputFile(csv_bytes, filename=f"logs_{period}.csv"),
+        caption=f"Экспорт логов: {period}"
+    )
+    await cb.answer("Готово")
 # /export для всех остальных
 @dp.message(Command("export"))
 async def export_denied(message: Message):
