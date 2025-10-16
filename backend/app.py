@@ -1,20 +1,34 @@
 from __future__ import annotations
 import os
 from typing import List, Optional, Literal
-
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+
 from .rag import load_chunks, get_model, embed_texts, build_index, search
-from .storage import init_db, insert_log, set_rating_by_id, fetch_logs
+from .storage import init_db, insert_log, set_rating_by_id, fetch_logs, fetch_logs_between
 
 try:
-    from gigachat import GigaChat  # опционально
+    from gigachat import GigaChat
 except Exception:
     GigaChat = None
+
+PROMPT_TEXT: str = ""
+
+def load_prompt_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            txt = f.read().strip()
+            if txt:
+                return txt
+    except Exception:
+        pass
+    return "Отвечай кратко. Если ответа нет в контексте — напиши 'Нет ответа.'"
 
 app = FastAPI(title="SRO BOT API", version="1.0.0")
 
@@ -47,11 +61,12 @@ async def _ensure_ready():
         raise HTTPException(503, detail="Model or index not initialized. Call /reload first.")
 
 
-def _compose_prompt(question: str, context: List[str]) -> str:
-    ctx = "\n---\n".join(context)
+def _compose_prompt(question: str, context: list[str]) -> str:
+    ctx = "\n---\n".join(context) if context else "(пусто)"
     return (
-        "Ответь по-русски, опираясь ТОЛЬКО на контекст ниже. Если ответа нет в контексте — скажи об этом.\n\n"
-        f"Вопрос: {question}\n\nКонтекст:\n{ctx}"
+        f"{PROMPT_TEXT}\n\n"
+        f"### ВОПРОС\n{question}\n\n"
+        f"### КОНТЕКСТ\n{ctx}"
     )
 
 
@@ -70,10 +85,54 @@ def _answer_with_gigachat(prompt: str) -> str:
 
 @app.on_event("startup")
 async def startup():
+    from dotenv import load_dotenv
     load_dotenv()
+    global PROMPT_TEXT
+    PROMPT_TEXT = load_prompt_file(os.getenv("PROMPT_PATH", "prompts/system.txt"))
     await init_db()
-    await reload_state()  # <-- теперь функция существует
+    await reload_state()
 
+def _compute_range(period: str) -> tuple[str, str]:
+    """
+    Возвращает (start_iso, end_iso) в UTC (tzinfo=None).
+    Если IANA-базы нет, считаем границы по UTC, чтобы не падать.
+    """
+    tzname = os.getenv("TIMEZONE", "Europe/Moscow")
+
+
+    tz = None
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = None
+
+    if tz is not None:
+        now_local = datetime.now(tz)
+        if period == "today":
+            start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "week":
+            start_local = now_local - timedelta(days=7)
+        elif period == "month":
+            start_local = now_local - timedelta(days=30)
+        else:
+            raise HTTPException(400, detail="period must be one of: today, week, month")
+
+        end_local = now_local
+        start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        end_utc   = end_local.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+        return start_utc, end_utc
+
+
+    now_utc = datetime.utcnow()
+    if period == "today":
+        start_utc_dt = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        start_utc_dt = now_utc - timedelta(days=7)
+    elif period == "month":
+        start_utc_dt = now_utc - timedelta(days=30)
+    else:
+        raise HTTPException(400, detail="period must be one of: today, week, month")
+    return start_utc_dt.isoformat(), now_utc.isoformat()
 
 @app.get("/health")
 async def health():
@@ -82,8 +141,9 @@ async def health():
 
 @app.post("/reload")
 async def reload_state():
-    """(Пере)загрузка базы знаний и индекса."""
-    global MODEL, INDEX, CHUNKS, EMB
+    global MODEL, INDEX, CHUNKS, EMB, PROMPT_TEXT
+
+    PROMPT_TEXT = load_prompt_file(os.getenv("PROMPT_PATH", "prompts/system.txt"))
 
     md_path = os.getenv("KNOWLEDGE_PATH", "knowledge/knowledge.md")
     model_name = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
@@ -124,8 +184,16 @@ async def feedback(req: FeedbackRequest):
 
 
 @app.get("/export")
-async def export(limit: int = 1000):
-    rows = await fetch_logs(limit)
+async def export(
+    limit: int = 1000,
+    period: str | None = Query(default=None, description="today | week | month"),
+):
+    if period:
+        start_iso, end_iso = _compute_range(period)
+        rows = await fetch_logs_between(start_iso, end_iso, limit=5000)
+    else:
+        rows = await fetch_logs(limit)
+
     import io, csv
     buf = io.StringIO()
     fieldnames = ["id", "ts", "chat_id", "query", "answer", "top_context", "rating"]
@@ -137,5 +205,6 @@ async def export(limit: int = 1000):
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename=\"logs.csv\"'},
+        headers={"Content-Disposition": 'attachment; filename="logs.csv"'},
     )
+
