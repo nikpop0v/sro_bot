@@ -49,3 +49,19 @@ async def fetch_logs(limit: int = 1000):
         async with db.execute(SELECT_ALL_SQL, (limit,)) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+SELECT_RANGE_SQL = """
+SELECT id, ts, chat_id, query, answer, top_context, rating
+FROM logs
+WHERE ts >= ? AND ts < ?
+ORDER BY ts DESC
+LIMIT ?
+"""
+
+async def fetch_logs_between(start_iso: str, end_iso: str, limit: int = 5000):
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(SELECT_RANGE_SQL, (start_iso, end_iso, limit)) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
